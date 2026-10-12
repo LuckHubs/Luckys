@@ -1,0 +1,162 @@
+-- Fixed / minified LuckyAimAssist
+local Players,RunService,UserInputService,HttpService,Workspace=game:GetService("Players"),game:GetService("RunService"),game:GetService("UserInputService"),game:GetService("HttpService"),game:GetService("Workspace")
+local LocalPlayer=Players.LocalPlayer
+local PlayerGui=LocalPlayer:WaitForChild("PlayerGui")
+local AimEnabled,ESPEnabled,FOVCircleEnabled=false,false,false
+local FOV,TrackingStrength,WallCheck,TeamCheck=120,0.20,true,true
+local ESPHighlights={},ConfigFileName="LuckyConfig.json"
+local function clamp(v,a,b) return math.max(a,math.min(b,v)) end
+local function ReadSavedConfig()
+    if type(readfile)~="function" or type(isfile)~="function" then return end
+    local ok,data=pcall(function()
+        if not isfile(ConfigFileName) then return nil end
+        return HttpService:JSONDecode(readfile(ConfigFileName))
+    end)
+    if ok and type(data)=="table" then
+        if type(data.FOV)=="number" then FOV=clamp(data.FOV,20,300) end
+        if type(data.TrackingStrength)=="number" then TrackingStrength=clamp(data.TrackingStrength,0.01,0.50) end
+        if type(data.TeamCheck)=="boolean" then TeamCheck=data.TeamCheck end
+        if type(data.AimEnabled)=="boolean" then AimEnabled=data.AimEnabled end
+        if type(data.ESPEnabled)=="boolean" then ESPEnabled=data.ESPEnabled end
+        if type(data.FOVCircleEnabled)=="boolean" then FOVCircleEnabled=data.FOVCircleEnabled end
+    end
+end
+ReadSavedConfig()
+local TEAM_MARKERS={"StageTeamSide","Team","TeamName","TeamColor","TeamId","TeamID","team"}
+local function readTeamMarker(inst)
+    if not inst then return nil end
+    for _,n in ipairs(TEAM_MARKERS) do
+        local a=inst:GetAttribute(n)
+        if a~=nil then return n.."="..tostring(a) end
+        local c=inst:FindFirstChild(n)
+        if c and c:IsA("ValueBase") then return n.."="..tostring(c.Value) end
+    end
+    return nil
+end
+local function getCustomTeamIdentity(p)
+    if not p then return nil end
+    local m=readTeamMarker(p) or readTeamMarker(p.Character)
+    if m then return m end
+    local stats=p:FindFirstChild("leaderstats")
+    if stats then m=readTeamMarker(stats) if m then return m end end
+    if p.TeamColor~=nil then return "TeamColor="..tostring(p.TeamColor) end
+    return nil
+end
+local customTeamCache={count=0,at=0}
+local function getCustomTeamCount()
+    local now=os.clock()
+    if now-customTeamCache.at>0.5 then
+        local seen={},c=0
+        for _,pl in ipairs(Players:GetPlayers()) do
+            local id=getCustomTeamIdentity(pl)
+            if id and not seen[id] then seen[id]=true; c=c+1 end
+        end
+        customTeamCache.count=c; customTeamCache.at=now
+    end
+    return customTeamCache.count
+end
+local function isTeammate(target)
+    if not target or target==LocalPlayer then return false end
+    if LocalPlayer.Team and target.Team then return LocalPlayer.Team==target.Team end
+    local lt=getCustomTeamIdentity(LocalPlayer); local tt=getCustomTeamIdentity(target)
+    if not lt or not tt then return false end
+    return getCustomTeamCount()>=2 and lt==tt
+end
+
+-- GUI (kept minimal)
+local OldGui=PlayerGui:FindFirstChild("LuckyAimAssist")
+if OldGui then OldGui:Destroy() end
+local ScreenGui=Instance.new("ScreenGui"); ScreenGui.Name="LuckyAimAssist"; ScreenGui.ResetOnSpawn=false; ScreenGui.IgnoreGuiInset=true; ScreenGui.DisplayOrder=100; ScreenGui.Parent=PlayerGui
+local FOVCircle=Instance.new("Frame"); FOVCircle.Name="FOVCircle"; FOVCircle.AnchorPoint=Vector2.new(0.5,0.5); FOVCircle.Position=UDim2.fromScale(0.5,0.5); FOVCircle.Size=UDim2.fromOffset(FOV*2,FOV*2); FOVCircle.BackgroundTransparency=1; FOVCircle.BorderSizePixel=0; FOVCircle.Visible=FOVCircleEnabled; FOVCircle.ZIndex=2; FOVCircle.Parent=ScreenGui
+local Menu=Instance.new("Frame"); Menu.Name="MiniMenu"; Menu.Size=UDim2.fromOffset(210,270); Menu.AnchorPoint=Vector2.new(0.5,0.5); Menu.Position=UDim2.new(0.5,0,0.4,0); Menu.BackgroundColor3=Color3.fromRGB(0,0,0); Menu.Parent=ScreenGui
+local ToggleButton=Instance.new("TextButton"); ToggleButton.Name="ToggleButton"; ToggleButton.Size=UDim2.fromOffset(54,54); ToggleButton.Position=UDim2.new(0.5,0,0.75,0); ToggleButton.Text="L"; ToggleButton.Parent=ScreenGui
+local AimButton=Instance.new("TextButton"); AimButton.Name="AimAssistButton"; AimButton.Position=UDim2.fromOffset(10,42); AimButton.Size=UDim2.new(1,-20,0,30); AimButton.Text= AimEnabled and "Aim Assist: ON" or "Aim Assist: OFF"; AimButton.Parent=Menu
+local ESPButton=Instance.new("TextButton"); ESPButton.Name="ESPButton"; ESPButton.Position=UDim2.fromOffset(10,78); ESPButton.Size=UDim2.new(1,-20,0,30); ESPButton.Text= ESPEnabled and "ESP: ON" or "ESP: OFF"; ESPButton.Parent=Menu
+local TeamButton=Instance.new("TextButton"); TeamButton.Name="TeamCheckButton"; TeamButton.Position=UDim2.fromOffset(10,114); TeamButton.Size=UDim2.new(1,-20,0,28); TeamButton.Text= TeamCheck and "Team Check: ON" or "Team Check: OFF"; TeamButton.Parent=Menu
+
+-- Buttons
+AimButton.Activated:Connect(function() AimEnabled=not AimEnabled; AimButton.Text= AimEnabled and "Aim Assist: ON" or "Aim Assist: OFF" end)
+ESPButton.Activated:Connect(function() ESPEnabled=not ESPEnabled; ESPButton.Text= ESPEnabled and "ESP: ON" or "ESP: OFF"; RefreshESP() end)
+TeamButton.Activated:Connect(function() TeamCheck=not TeamCheck; TeamButton.Text= TeamCheck and "Team Check: ON" or "Team Check: OFF" end)
+
+-- sliders helper (kept functional but concise)
+local function MakeSlider(Name,LabelText,Y,Min,Max,Init,Format,OnChanged)
+    local Track=Instance.new("TextButton"); Track.Name=Name.."Slider"; Track.Position=UDim2.fromOffset(10,Y+19); Track.Size=UDim2.new(1,-20,0,12); Track.Parent=Menu
+    local Fill=Instance.new("Frame"); Fill.Name="Fill"; Fill.Size=UDim2.new((Init-Min)/(Max-Min),0,1,0); Fill.Parent=Track
+    local Knob=Instance.new("Frame"); Knob.AnchorPoint=Vector2.new(0.5,0.5); Knob.Position=UDim2.new((Init-Min)/(Max-Min),0,0.5,0); Knob.Size=UDim2.fromOffset(14,14); Knob.Parent=Track
+    local Value=Init; local Sliding=false; local ActiveInput=nil
+    local function SetFromX(X)
+        local Width=math.max(1,Track.AbsoluteSize.X); local Alpha=clamp((X-Track.AbsolutePosition.X)/Width,0,1)
+        Value=Min+(Max-Min)*Alpha
+        if Max>10 then Value=math.floor(Value+0.5) else Value=math.floor(Value*100+0.5)/100 end
+        local Percent=(Value-Min)/(Max-Min)
+        Fill.Size=UDim2.new(Percent,0,1,0); Knob.Position=UDim2.new(Percent,0,0.5,0)
+        if type(OnChanged)=="function" then OnChanged(Value) end
+    end
+    Track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then Sliding=true; ActiveInput=i; SetFromX(i.Position.X) end end)
+    UserInputService.InputChanged:Connect(function(i) if not Sliding then return end; if i==ActiveInput or (ActiveInput and ActiveInput.UserInputType==Enum.UserInputType.MouseButton1 and i.UserInputType==Enum.UserInputType.MouseMovement) then SetFromX(i.Position.X) end end)
+    UserInputService.InputEnded:Connect(function(i) if i==ActiveInput or i.UserInputType==Enum.UserInputType.MouseButton1 then Sliding=false; ActiveInput=nil end end)
+end
+MakeSlider("FOV","FOV",148,20,300,FOV,function(v) return tostring(v).." px" end,function(v) FOV=v; FOVCircle.Size=UDim2.fromOffset(FOV*2,FOV*2) end)
+MakeSlider("Smoothness","Smoothness",190,0.01,0.50,TrackingStrength,function(v) return string.format("%.2f",v) end,function(v) TrackingStrength=v end)
+
+-- ESP
+local function RemoveESP(Player) local H=ESPHighlights[Player] if H then H:Destroy(); ESPHighlights[Player]=nil end end
+local function CreateESP(Player)
+    if Player==LocalPlayer then return end
+    local Char=Player.Character if not Char then RemoveESP(Player); return end
+    local Hum=Char:FindFirstChildOfClass("Humanoid") if not Hum or Hum.Health<=0 then RemoveESP(Player); return end
+    local H=ESPHighlights[Player] if not H or H.Parent~=Char then RemoveESP(Player); H=Instance.new("Highlight"); H.Name="LuckyTeamESP"; H.Adornee=Char; H.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; H.FillTransparency=1; H.OutlineTransparency=0.4; H.Parent=Char; ESPHighlights[Player]=H end
+    local IsT=isTeammate(Player); H.OutlineColor= IsT and Color3.fromRGB(0,145,255) or Color3.fromRGB(255,55,55)
+end
+function RefreshESP()
+    if not ESPEnabled then for p in pairs(ESPHighlights) do RemoveESP(p) end return end
+    for _,p in ipairs(Players:GetPlayers()) do if p~=LocalPlayer then CreateESP(p) end end
+end
+Players.PlayerRemoving:Connect(RemoveESP)
+Players.PlayerAdded:Connect(function(p) p.CharacterAdded:Connect(function() task.wait(0.2) if ESPEnabled then CreateESP(p) end end) end)
+
+-- Targeting
+local function GetTarget()
+    local Camera=Workspace.CurrentCamera if not Camera then return nil end
+    local V=Camera.ViewportSize if not V or V.X<=0 or V.Y<=0 then return nil end
+    local Center=Vector2.new(V.X/2,V.Y/2); local ClosestHead=nil; local ClosestDist=FOV
+    for _,pl in ipairs(Players:GetPlayers()) do
+        local IsT=isTeammate(pl)
+        if pl~=LocalPlayer and not (TeamCheck and IsT) then
+            local Char=pl.Character
+            if Char then
+                local Hum=Char:FindFirstChildOfClass("Humanoid"); local Head=Char:FindFirstChild("Head")
+                if Hum and Hum.Health>0 and Head then
+                    local Pos,on=Camera:WorldToViewportPoint(Head.Position)
+                    if on and Pos.Z>0 then
+                        local P=Vector2.new(Pos.X,Pos.Y); local Dist=(P-Center).Magnitude
+                        if Dist<=ClosestDist then
+                            local Origin=Camera.CFrame.Position; local Dir=Head.Position-Origin
+                            local Params=RaycastParams.new(); Params.FilterType=Enum.RaycastFilterType.Exclude
+                            local Filter={}
+                            local LC=LocalPlayer.Character if LC then table.insert(Filter,LC) end
+                            Params.FilterDescendantsInstances=Filter; Params.IgnoreWater=true
+                            local Result=Workspace:Raycast(Origin,Dir,Params); local Visible=true
+                            if WallCheck then if Result~=nil and Result.Instance~=nil and not Result.Instance:IsDescendantOf(Char) then Visible=false end end
+                            if Visible then ClosestDist=Dist; ClosestHead=Head end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return ClosestHead
+end
+
+-- Aim loop
+local LastESPRefresh=0
+RunService.RenderStepped:Connect(function()
+    local Now=os.clock()
+    if Now-LastESPRefresh>=0.20 then RefreshESP(); LastESPRefresh=Now end
+    FOVCircle.Visible=FOVCircleEnabled
+    local Camera=Workspace.CurrentCamera if not Camera or not AimEnabled then return end
+    local Target=GetTarget() if not Target then return end
+    local Desired=CFrame.lookAt(Camera.CFrame.Position,Target.Position)
+    Camera.CFrame=Camera.CFrame:Lerp(Desired,clamp(TrackingStrength,0,1))
+end)
